@@ -1,0 +1,19 @@
+# Clés API - Ne jamais commiter !
+.env
+dear.txt
+
+# Autres fichiers à ignorer
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Logs
+*.log
+
+*.zip
+*.rar
+inspirations/*.zip
