@@ -1,9 +1,15 @@
+
 import { useState } from 'react'
 import axios from 'axios'
-import { createFile, parseRepoFullName } from '../services/github'
+import {
+  createFile,
+  parseRepoFullName,
+  listFiles,
+  readFile
+} from '../services/github'
 
 interface ChatProps {
-  selectedAgent: 'groq' | 'kimi' | 'claude'
+  selectedAgent: 'groq' | 'kimi' | 'claude' | 'kimi-wavespeed'
   githubToken?: string
   isTokenValid?: boolean
   selectedRepo?: string | null
@@ -19,7 +25,6 @@ function Chat({
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // Détecte un bloc d'action GitHub dans la réponse de l'agent
   const extractGitHubAction = (text: string) => {
     const match = text.match(/```github-action\s*([\s\S]*?)```/)
     if (!match) return null
@@ -44,34 +49,35 @@ function Chat({
 
     const systemMessage = {
       role: 'system',
-      content: isTokenValid && selectedRepo
-        ? `Tu es un assistant de code dans TrappistCode.
+      content:
+        isTokenValid && selectedRepo
+          ? `Tu es un assistant de code dans TrappistCode.
 Repo actif : ${selectedRepo}
 Token GitHub : connecté
 
-Quand l'utilisateur te demande de CRÉER un fichier (html, js, py, md, css, etc.), tu dois :
-1. Écrire une courte explication
-2. Ensuite obligatoirement un bloc exactement comme ceci :
+Tu as 3 actions. Quand tu en as besoin, termine avec UN bloc :
 
 \`\`\`github-action
-{
-  "action": "create_file",
-  "path": "nom-du-fichier.ext",
-  "content": "contenu complet du fichier ici",
-  "message": "Add nom-du-fichier.ext"
-}
+{ ... }
 \`\`\`
 
+1) Lister un dossier ("" = racine) :
+{"action":"list_files","path":""}
+
+2) Lire un fichier :
+{"action":"read_file","path":"index.html"}
+
+3) Créer ou mettre à jour un fichier :
+{"action":"create_file","path":"index.html","content":"...","message":"Update index.html"}
+
 Règles :
-- path = chemin du fichier (ex: index.html ou src/app.js)
-- content = le contenu COMPLET du fichier
-- message = message de commit
-- Tu peux créer n'importe quel type de fichier
-- Ne simule PAS git/bash. Utilise uniquement ce bloc github-action.
-- Si l'utilisateur ne demande pas de créer un fichier, réponds normalement sans ce bloc.`
-        : isTokenValid
-          ? `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande à l'utilisateur de choisir un repo.`
-          : `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
+- Ne devine pas le contenu des fichiers : utilise list_files ou read_file
+- Ne simule pas git/bash
+- path peut être un sous-dossier (ex: src/app.js)
+- Si aucune action n'est nécessaire, réponds normalement sans bloc`
+          : isTokenValid
+            ? `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande à l'utilisateur de choisir un repo.`
+            : `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
     }
 
     const messagesForApi = [systemMessage, ...updatedMessages]
@@ -103,7 +109,9 @@ Règles :
           '/wavespeed/v1/chat/completions',
           { model, messages: messagesForApi },
           {
-            headers: { Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}` },
+            headers: {
+              Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}`
+            },
             timeout: 600000
           }
         )
@@ -113,47 +121,79 @@ Règles :
       }
     }
 
-    // Affiche d'abord la réponse de l'agent
-    setMessages((prev) => [...prev, { role: 'assistant', content: responseContent }])
+    setMessages((prev) => [
+      ...prev,
+      { role: 'assistant', content: responseContent }
+    ])
 
-    // --- Exécution réelle sur GitHub ---
+    // --- Exécution GitHub ---
     const action = extractGitHubAction(responseContent)
 
-    if (
-      action &&
-      action.action === 'create_file' &&
-      isTokenValid &&
-      selectedRepo &&
-      githubToken
-    ) {
+    if (action && isTokenValid && selectedRepo && githubToken) {
       try {
         const { owner, repo } = parseRepoFullName(selectedRepo)
 
-        await createFile({
-          token: githubToken,
-          owner,
-          repo,
-          path: action.path,
-          content: action.content,
-          message: action.message || `Add ${action.path}`
-        })
+        if (action.action === 'list_files') {
+          const files = await listFiles({
+            token: githubToken,
+            owner,
+            repo,
+            path: action.path || ''
+          })
+          const listing = files
+            .map((f) => `${f.type === 'dir' ? '📁' : '📄'} ${f.path}`)
+            .join('\n')
 
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: `✅ Fichier **${action.path}** créé et pushé sur GitHub.\nRepo : ${selectedRepo}\nVérifie ici : https://github.com/${selectedRepo}`
-          }
-        ])
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: 'assistant',
+              content: `📂 Contenu de ${action.path || '/'} :\n\n${listing || '(vide)'}`
+            }
+          ])
+        }
+
+        if (action.action === 'read_file') {
+          const file = await readFile({
+            token: githubToken,
+            owner,
+            repo,
+            path: action.path
+          })
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: 'assistant',
+              content: `📄 ${file.path}\n\n\`\`\`\n${file.content}\n\`\`\``
+            }
+          ])
+        }
+
+        if (action.action === 'create_file') {
+          await createFile({
+            token: githubToken,
+            owner,
+            repo,
+            path: action.path,
+            content: action.content,
+            message: action.message || `Add ${action.path}`
+          })
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: 'assistant',
+              content: `✅ Fichier **${action.path}** créé/mis à jour sur GitHub.\nhttps://github.com/${selectedRepo}`
+            }
+          ])
+        }
       } catch (e: any) {
         const errMsg =
           e?.response?.data?.message || e?.message || 'Erreur inconnue'
         setMessages((prev) => [
           ...prev,
-          {
-            role: 'assistant',
-            content: `❌ Erreur GitHub : ${errMsg}`
-          }
+          { role: 'assistant', content: `❌ Erreur GitHub : ${errMsg}` }
         ])
       }
     }
@@ -220,44 +260,13 @@ Règles :
               maxWidth: '90%',
               padding: '16px',
               borderRadius: '8px',
-              backgroundColor: msg.role === 'user' ? '#094771' : '#1e1e1e'
+              backgroundColor: msg.role === 'user' ? '#094771' : '#252526',
+              color: '#cccccc',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word'
             }}
           >
-            {msg.role === 'assistant' ? (
-              <div style={{ whiteSpace: 'pre-wrap' }}>
-                {msg.content.split('```').map((part, i) => {
-                  if (i % 2 === 1) {
-                    return (
-                      <pre
-                        key={i}
-                        style={{
-                          backgroundColor: '#0d1117',
-                          padding: '20px',
-                          borderRadius: '6px',
-                          fontFamily: 'Consolas, monospace',
-                          fontSize: '14px',
-                          lineHeight: '1.5',
-                          color: '#c9d1d9',
-                          overflowX: 'auto',
-                          margin: '12px 0'
-                        }}
-                      >
-                        {part}
-                      </pre>
-                    )
-                  }
-                  return (
-                    <div key={i} style={{ marginBottom: '12px' }}>
-                      {part}
-                    </div>
-                  )
-                })}
-              </div>
-            ) : (
-              <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                {msg.content}
-              </div>
-            )}
+            {msg.content || '(message vide)'}
           </div>
         ))}
         {loading && <div style={{ color: '#666' }}>Agent réfléchit...</div>}
@@ -277,7 +286,7 @@ Règles :
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-            placeholder="Ex: crée index.html fond noir bouton vert"
+            placeholder="Ex: lis les fichiers · lis index.html · crée un README"
             style={{
               flex: 1,
               backgroundColor: '#3c3c3c',
