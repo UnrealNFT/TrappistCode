@@ -13,11 +13,15 @@ interface ChatProps {
   githubToken?: string
   isTokenValid?: boolean
   selectedRepo?: string | null
+  openPath?: string | null
+  fileContent?: string
+  onApplyEdit?: (content: string) => void
 }
 
 const MAX_HISTORY = 12
 const MAX_CONTENT_CHARS = 4000
-const MAX_AUTO_STEPS = 6
+const MAX_AUTO_STEPS = 20
+const BUFFER_PREVIEW = 6000
 
 function truncateContent(content: string): string {
   if (content.length <= MAX_CONTENT_CHARS) return content
@@ -33,11 +37,21 @@ function extractResponseText(message: any): string {
   return content || reasoning || '(réponse vide)'
 }
 
+/** Affiche un résumé : enlève les gros blocs github-action du chat */
+function displayContent(text: string): string {
+  return text
+    .replace(/```github-action\s*[\s\S]*?```/g, '⟦action exécutée⟧')
+    .trim()
+}
+
 function Chat({
   selectedAgent,
   githubToken = '',
   isTokenValid = false,
   selectedRepo = null,
+  openPath = null,
+  fileContent = '',
+  onApplyEdit,
 }: ChatProps) {
   const [messages, setMessages] = useState<
     Array<{ role: string; content: string }>
@@ -46,7 +60,7 @@ function Chat({
   const [loading, setLoading] = useState(false)
   const [autonomous, setAutonomous] = useState(false)
 
-  const extractGitHubAction = (text: string) => {
+  const extractAction = (text: string) => {
     const match = text.match(/```github-action\s*([\s\S]*?)```/)
     if (!match) return null
     const raw = match[1].trim()
@@ -58,50 +72,64 @@ function Chat({
   }
 
   const buildSystemPrompt = () => {
-    if (!isTokenValid) {
-      return `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
-    }
-    if (!selectedRepo) {
-      return `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande de choisir un repo.`
-    }
-
-    let prompt = `Tu es un assistant de code dans TrappistCode.
-Repo actif : ${selectedRepo}
-Token GitHub : connecté.
-
-Actions — UN seul bloc par réponse :
-
-\`\`\`github-action
-{ ... }
+    const bufferInfo =
+      openPath && fileContent !== undefined
+        ? `
+Fichier OUVERT dans l'éditeur : ${openPath}
+Contenu actuel (peut être tronqué) :
+\`\`\`
+${fileContent.slice(0, BUFFER_PREVIEW)}${fileContent.length > BUFFER_PREVIEW ? '\n…[tronqué]' : ''}
 \`\`\`
 
-1) list_files :
-{"action":"list_files","path":""}
+Actions LOCALES (prioritaires — modifient l'éditeur, PAS GitHub) :
 
-2) read_file :
-{"action":"read_file","path":"src/App.tsx"}
+5) edit_buffer — remplace un morceau exact dans l'éditeur :
+{"action":"edit_buffer","oldText":"texte exact","newText":"nouveau"}
 
-3) create_file (content max ~2500 caractères) :
-{"action":"create_file","path":"README.md","content":"...","message":"Add README"}
+6) set_buffer — remplace tout le contenu de l'éditeur :
+{"action":"set_buffer","content":"..."}
 
-4) patch_file (préféré pour modifier un fichier existant) :
-{"action":"patch_file","path":"src/App.tsx","oldText":"texte exact","newText":"nouveau","message":"Patch"}
+Règles buffer :
+- Préfère edit_buffer / set_buffer pour modifier le fichier ouvert
+- L'utilisateur fera Push lui-même depuis l'éditeur
+- N'affirme PAS que c'est poussé sur GitHub après un edit_buffer
+`
+        : `
+Aucun fichier ouvert dans l'éditeur. Demande à l'utilisateur d'en ouvrir un via le panel GitHub, ou utilise list_files / read_file.
+`
+
+    if (!isTokenValid) {
+      return `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.${bufferInfo}`
+    }
+    if (!selectedRepo) {
+      return `Tu es un assistant dans TrappistCode. Token OK mais aucun repo sélectionné.${bufferInfo}`
+    }
+
+    let prompt = `Tu es un assistant de code dans TrappistCode (mode type Copilot).
+Repo actif : ${selectedRepo}
+Token GitHub : connecté.
+${bufferInfo}
+
+Actions GitHub (UN seul bloc \`\`\`github-action par réponse) :
+
+1) list_files : {"action":"list_files","path":""}
+2) read_file : {"action":"read_file","path":"src/App.tsx"}
+3) create_file (max ~2500 car.) : {"action":"create_file","path":"...","content":"...","message":"..."}
+4) patch_file (sur GitHub direct) : {"action":"patch_file","path":"...","oldText":"...","newText":"...","message":"..."}
 
 Règles :
+- Fichier ouvert → utilise edit_buffer / set_buffer (local)
+- Ne colle PAS de longs fichiers dans ta réponse texte
 - Ne simule pas git/bash
-- N'affirme JAMAIS qu'un fichier est poussé : l'app le fait après ton bloc
-- Gros fichier : patch_file ou plusieurs petits create_file
-- Ne devine pas le contenu : read_file d'abord
 - Si aucune action : réponds SANS bloc`
 
     if (autonomous) {
       prompt += `
 
 MODE AUTONOMIE :
-- Avance jusqu'à finir la tâche
-- Une seule action github-action par réponse
-- Après chaque résultat système, continue sans demander confirmation
-- Quand c'est terminé : résumé court SANS bloc github-action`
+- Une action max par réponse
+- Continue après chaque résultat jusqu'à finir
+- Fin : résumé court SANS bloc`
     }
     return prompt
   }
@@ -164,7 +192,33 @@ MODE AUTONOMIE :
     return `❌ Erreur ${selectedAgent}`
   }
 
-  const runGitHubAction = async (action: any): Promise<string> => {
+  const runAction = async (action: any): Promise<string> => {
+    // --- Actions locales (éditeur) ---
+    if (action.action === 'edit_buffer') {
+      if (!openPath) return '❌ Aucun fichier ouvert dans l’éditeur'
+      if (!onApplyEdit) return '❌ onApplyEdit manquant'
+      if (typeof action.oldText !== 'string' || typeof action.newText !== 'string') {
+        return '❌ edit_buffer incomplet (oldText/newText)'
+      }
+      if (!fileContent.includes(action.oldText)) {
+        return '❌ oldText introuvable dans le buffer. Relis le fichier ou utilise un extrait exact.'
+      }
+      const next = fileContent.replace(action.oldText, action.newText)
+      onApplyEdit(next)
+      return `✅ Modif appliquée dans l’éditeur (**${openPath}**). Clique Push pour envoyer sur GitHub.`
+    }
+
+    if (action.action === 'set_buffer') {
+      if (!openPath) return '❌ Aucun fichier ouvert dans l’éditeur'
+      if (!onApplyEdit) return '❌ onApplyEdit manquant'
+      if (typeof action.content !== 'string') {
+        return '❌ set_buffer incomplet (content)'
+      }
+      onApplyEdit(action.content)
+      return `✅ Buffer remplacé dans l’éditeur (**${openPath}**). Clique Push pour envoyer sur GitHub.`
+    }
+
+    // --- Actions GitHub ---
     if (!selectedRepo || !githubToken) return '❌ Token ou repo manquant'
     const { owner, repo } = parseRepoFullName(selectedRepo)
 
@@ -189,13 +243,12 @@ MODE AUTONOMIE :
         repo,
         path: action.path,
       })
-      const body = truncateContent(file.content)
-      return `📄 ${file.path}\n\n\`\`\`\n${body}\n\`\`\``
+      return `📄 ${file.path} (${file.content.length} car.)\nAperçu:\n\`\`\`\n${truncateContent(file.content)}\n\`\`\``
     }
 
     if (action.action === 'create_file') {
       if (!action.path || typeof action.content !== 'string') {
-        throw new Error('create_file incomplet (path/content)')
+        throw new Error('create_file incomplet')
       }
       await createFile({
         token: githubToken,
@@ -205,15 +258,16 @@ MODE AUTONOMIE :
         content: action.content,
         message: action.message || `Add ${action.path}`,
       })
-      return (
-        `✅ Fichier **${action.path}** créé/mis à jour.\n` +
-        `https://github.com/${selectedRepo}/blob/main/${action.path}`
-      )
+      return `✅ Fichier **${action.path}** créé/mis à jour sur GitHub.`
     }
 
     if (action.action === 'patch_file') {
-      if (!action.path || typeof action.oldText !== 'string' || typeof action.newText !== 'string') {
-        throw new Error('patch_file incomplet (path/oldText/newText)')
+      if (
+        !action.path ||
+        typeof action.oldText !== 'string' ||
+        typeof action.newText !== 'string'
+      ) {
+        throw new Error('patch_file incomplet')
       }
       await patchFile({
         token: githubToken,
@@ -224,10 +278,7 @@ MODE AUTONOMIE :
         newText: action.newText,
         message: action.message || `Patch ${action.path}`,
       })
-      return (
-        `✅ Patch appliqué sur **${action.path}**.\n` +
-        `https://github.com/${selectedRepo}/blob/main/${action.path}`
-      )
+      return `✅ Patch GitHub sur **${action.path}**.`
     }
 
     return `❌ Action inconnue : ${action.action}`
@@ -268,8 +319,7 @@ MODE AUTONOMIE :
         thread = [...thread, { role: 'assistant', content: responseContent }]
         setMessages(thread)
 
-        const action = extractGitHubAction(responseContent)
-
+        const action = extractAction(responseContent)
         if (!action) break
 
         if (action.__parseError) {
@@ -278,21 +328,7 @@ MODE AUTONOMIE :
             {
               role: 'assistant',
               content:
-                '❌ Action GitHub invalide : JSON tronqué.\nUtilise patch_file ou un fichier plus petit.',
-            },
-          ]
-          setMessages(thread)
-          break
-        }
-
-        if (!isTokenValid || !selectedRepo || !githubToken) {
-          thread = [
-            ...thread,
-            {
-              role: 'assistant',
-              content: !isTokenValid
-                ? '❌ Token GitHub manquant.'
-                : '❌ Aucun repo sélectionné.',
+                '❌ Action invalide : JSON tronqué. Utilise edit_buffer avec un petit extrait.',
             },
           ]
           setMessages(thread)
@@ -301,22 +337,18 @@ MODE AUTONOMIE :
 
         let result = ''
         try {
-          result = await runGitHubAction(action)
+          result = await runAction(action)
         } catch (e: any) {
           const status = e?.response?.status
           const errMsg =
             e?.response?.data?.message || e?.message || 'Erreur inconnue'
-          result = `❌ Erreur GitHub (${status || '?'}) : ${errMsg}`
+          result = `❌ Erreur (${status || '?'}) : ${errMsg}`
         }
 
         thread = [...thread, { role: 'assistant', content: result }]
         setMessages(thread)
 
-        // Mode normal : une seule action puis stop
         if (!autonomous) break
-
-        // Mode autonomie : on renvoie le résultat au LLM au tour suivant
-        // (déjà dans thread → recent)
       }
 
       if (autonomous && steps >= MAX_AUTO_STEPS) {
@@ -324,7 +356,7 @@ MODE AUTONOMIE :
           ...thread,
           {
             role: 'assistant',
-            content: `⏹️ Limite autonomie atteinte (${MAX_AUTO_STEPS} étapes). Relance si besoin.`,
+            content: `⏹️ Limite autonomie (${MAX_AUTO_STEPS} étapes).`,
           },
         ]
         setMessages(thread)
@@ -346,7 +378,6 @@ MODE AUTONOMIE :
         overflow: 'hidden',
       }}
     >
-      {/* Tab bar */}
       <div
         style={{
           height: '35px',
@@ -404,21 +435,18 @@ MODE AUTONOMIE :
           Autonomie
         </label>
 
-        {isTokenValid && (
-          <div
-            style={{
-              marginLeft: 'auto',
-              paddingRight: '16px',
-              fontSize: '11px',
-              color: '#4ec9b0',
-            }}
-          >
-            GitHub OK {selectedRepo ? `· ${selectedRepo}` : ''}
-          </div>
-        )}
+        <div
+          style={{
+            marginLeft: 'auto',
+            paddingRight: '16px',
+            fontSize: '11px',
+            color: openPath ? '#4ec9b0' : '#666',
+          }}
+        >
+          {openPath ? `📝 ${openPath}` : 'aucun fichier'}
+        </div>
       </div>
 
-      {/* Messages */}
       <div
         style={{
           flex: 1,
@@ -432,12 +460,7 @@ MODE AUTONOMIE :
       >
         {messages.length === 0 && (
           <div style={{ textAlign: 'center', color: '#666', marginTop: '80px' }}>
-            Commence à parler...
-            {autonomous && (
-              <div style={{ marginTop: 8, color: '#4ec9b0', fontSize: 12 }}>
-                Mode autonomie ON — l’agent enchaîne jusqu’à {MAX_AUTO_STEPS} étapes
-              </div>
-            )}
+            Ouvre un fichier à droite, puis demande une modif…
           </div>
         )}
         {messages.map((msg, index) => (
@@ -454,7 +477,7 @@ MODE AUTONOMIE :
               flexShrink: 0,
             }}
           >
-            {msg.content || '(message vide)'}
+            {displayContent(msg.content) || '(message vide)'}
           </div>
         ))}
         {loading && (
@@ -464,7 +487,6 @@ MODE AUTONOMIE :
         )}
       </div>
 
-      {/* Input */}
       <div
         style={{
           padding: '16px',
@@ -479,7 +501,7 @@ MODE AUTONOMIE :
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-            placeholder="Ex: lis les fichiers · patch App.tsx · crée un README"
+            placeholder="Ex: ajoute un commentaire en haut du fichier ouvert"
             style={{
               flex: 1,
               backgroundColor: '#3c3c3c',

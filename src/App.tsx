@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import Chat from './components/Chat'
 import GitHubPanel from './components/GitHubPanel'
 import Editor from './components/Editor'
@@ -10,6 +10,23 @@ function App() {
   const [githubToken, setGithubToken] = useState('')
   const [isTokenValid, setIsTokenValid] = useState(false)
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null)
+
+  // --- Buffer fichier ouvert (mode Copilot) ---
+  const [openPath, setOpenPath] = useState<string | null>(null)
+  const [fileContent, setFileContent] = useState('')
+  const [savedContent, setSavedContent] = useState('')
+
+  const openFile = useCallback((path: string, content: string) => {
+    setOpenPath(path)
+    setFileContent(content)
+    setSavedContent(content)
+  }, [])
+
+  const onSaved = useCallback(() => {
+    setSavedContent(fileContent)
+  }, [fileContent])
+
+  const dirty = openPath !== null && fileContent !== savedContent
 
   return (
     <div
@@ -65,7 +82,7 @@ function App() {
         </div>
       </div>
 
-      {/* Main: sidebar + chat + editor */}
+      {/* Main */}
       <div
         style={{
           display: 'flex',
@@ -92,6 +109,8 @@ function App() {
             setIsTokenValid={setIsTokenValid}
             selectedRepo={selectedRepo}
             setSelectedRepo={setSelectedRepo}
+            openPath={openPath}
+            onOpenFile={openFile}
           />
         </div>
 
@@ -112,6 +131,9 @@ function App() {
             githubToken={githubToken}
             isTokenValid={isTokenValid}
             selectedRepo={selectedRepo}
+            openPath={openPath}
+            fileContent={fileContent}
+            onApplyEdit={setFileContent}
           />
         </div>
 
@@ -129,7 +151,11 @@ function App() {
           <Editor
             githubToken={githubToken}
             selectedRepo={selectedRepo}
-            filePath="src/App.tsx"
+            openPath={openPath}
+            content={fileContent}
+            savedContent={savedContent}
+            onChange={setFileContent}
+            onSaved={onSaved}
           />
         </div>
       </div>
@@ -151,6 +177,12 @@ function App() {
         <span>{selectedAgent}</span>
         <span>{isTokenValid ? 'GitHub OK' : 'GitHub off'}</span>
         {selectedRepo && <span>{selectedRepo}</span>}
+        {openPath && (
+          <span style={{ marginLeft: 'auto' }}>
+            {openPath}
+            {dirty ? ' •' : ''}
+          </span>
+        )}
       </div>
     </div>
   )

@@ -1,104 +1,223 @@
-import { useState, useRef } from 'react'
-import { readFile, createFile, parseRepoFullName } from '../services/github'
+import { useMemo, useState } from 'react'
+import CodeMirror from '@uiw/react-codemirror'
+import { oneDark } from '@codemirror/theme-one-dark'
+import { javascript } from '@codemirror/lang-javascript'
+import { html } from '@codemirror/lang-html'
+import { css } from '@codemirror/lang-css'
+import { json } from '@codemirror/lang-json'
+import { markdown } from '@codemirror/lang-markdown'
+import { python } from '@codemirror/lang-python'
+import { createFile, parseRepoFullName } from '../services/github'
 
 interface Props {
   githubToken: string
   selectedRepo: string | null
-  filePath?: string
+  openPath: string | null
+  content: string
+  savedContent: string
+  onChange: (content: string) => void
+  onSaved: () => void
 }
 
 const LANGS: Record<string, string> = {
-  ts: 'TypeScript', tsx: 'TSX', js: 'JavaScript', jsx: 'JSX',
-  json: 'JSON', css: 'CSS', html: 'HTML', md: 'Markdown', py: 'Python',
+  ts: 'TypeScript',
+  tsx: 'TSX',
+  js: 'JavaScript',
+  jsx: 'JSX',
+  json: 'JSON',
+  css: 'CSS',
+  html: 'HTML',
+  md: 'Markdown',
+  py: 'Python',
 }
 
 const btn: React.CSSProperties = {
-  backgroundColor: '#3c3c3c', color: '#cccccc', border: '1px solid #3e3e42',
-  borderRadius: '4px', padding: '4px 10px', fontSize: '12px', cursor: 'pointer',
+  backgroundColor: '#3c3c3c',
+  color: '#cccccc',
+  border: '1px solid #3e3e42',
+  borderRadius: '4px',
+  padding: '4px 10px',
+  fontSize: '12px',
+  cursor: 'pointer',
 }
 
-function Editor({ githubToken, selectedRepo, filePath = 'src/App.tsx' }: Props) {
-  const [path, setPath] = useState(filePath)
-  const [code, setCode] = useState('// Ouvre un fichier GitHub...\n')
-  const [cursor, setCursor] = useState({ line: 1, col: 1 })
-  const [dirty, setDirty] = useState(false)
-  const [status, setStatus] = useState('')
-  const taRef = useRef<HTMLTextAreaElement>(null)
+function langExtension(path: string | null) {
+  const ext = path?.split('.').pop()?.toLowerCase() || ''
+  if (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') {
+    return javascript({ jsx: true, typescript: ext === 'ts' || ext === 'tsx' })
+  }
+  if (ext === 'html' || ext === 'htm') return html()
+  if (ext === 'css') return css()
+  if (ext === 'json') return json()
+  if (ext === 'md' || ext === 'markdown') return markdown()
+  if (ext === 'py') return python()
+  return javascript()
+}
 
-  const ext = path.split('.').pop()?.toLowerCase() || ''
-  const lang = LANGS[ext] || 'Plain Text'
-  const lines = code.split('\n')
+function Editor({
+  githubToken,
+  selectedRepo,
+  openPath,
+  content,
+  savedContent,
+  onChange,
+  onSaved,
+}: Props) {
+  const [status, setStatus] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const dirty = openPath !== null && content !== savedContent
+  const ext = openPath?.split('.').pop()?.toLowerCase() || ''
+  const langLabel = LANGS[ext] || (openPath ? 'Plain Text' : '—')
+  const lines = content ? content.split('\n').length : 0
   const repo = selectedRepo ? parseRepoFullName(selectedRepo) : null
 
-  const load = async () => {
-    if (!githubToken || !repo) return setStatus('Token ou repo manquant')
-    setStatus('Chargement...')
-    try {
-      const f = await readFile({ token: githubToken, owner: repo.owner, repo: repo.repo, path })
-      setCode(f.content)
-      setDirty(false)
-      setStatus('Charge')
-    } catch (e: any) {
-      setStatus(e.response?.status === 404 ? 'Fichier introuvable' : 'Erreur: ' + e.message)
-    }
-  }
+  const extensions = useMemo(
+    () => [langExtension(openPath), oneDark],
+    [openPath]
+  )
 
   const save = async () => {
+    if (!openPath) return setStatus('Aucun fichier ouvert')
     if (!githubToken || !repo) return setStatus('Token ou repo manquant')
+    setSaving(true)
     setStatus('Push en cours...')
     try {
-      await createFile({ token: githubToken, owner: repo.owner, repo: repo.repo, path, content: code })
-      setDirty(false)
-      setStatus('Pushe sur GitHub')
+      await createFile({
+        token: githubToken,
+        owner: repo.owner,
+        repo: repo.repo,
+        path: openPath,
+        content,
+        message: `Update ${openPath} via TrappistCode`,
+      })
+      onSaved()
+      setStatus('Poussé sur GitHub')
+      setTimeout(() => setStatus(''), 2500)
     } catch (e: any) {
-      setStatus('Erreur: ' + e.message)
+      setStatus('Erreur: ' + (e?.response?.data?.message || e.message))
     }
-  }
-
-  const syncCursor = () => {
-    const ta = taRef.current
-    if (!ta) return
-    const before = ta.value.slice(0, ta.selectionStart)
-    setCursor({ line: before.split('\n').length, col: before.length - before.lastIndexOf('\n') })
-  }
-
-  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    const ta = taRef.current
-    if (!ta) return
-    const { selectionStart: s, selectionEnd: en, value } = ta
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save(); return }
-    if (e.key === 'Tab') {
-      e.preventDefault()
-      setCode(value.slice(0, s) + '  ' + value.slice(en))
-      setDirty(true)
-      requestAnimationFrame(() => ta.setSelectionRange(s + 2, s + 2))
-    }
+    setSaving(false)
   }
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e1e', minWidth: 0 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 12px', backgroundColor: '#2d2d30', borderBottom: '1px solid #3e3e42' }}>
-        <input value={path} onChange={(e) => setPath(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()}
-          style={{ flex: 1, backgroundColor: '#3c3c3c', color: '#cccccc', border: '1px solid #3e3e42', borderRadius: '4px', padding: '4px 8px', fontFamily: 'Consolas, monospace', fontSize: '12px', outline: 'none' }} />
-        <button onClick={load} style={btn}>Ouvrir</button>
-        <button onClick={save} style={{ ...btn, backgroundColor: dirty ? '#0e639c' : '#3c3c3c' }}>Push{dirty ? ' *' : ''}</button>
-      </div>
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        <div style={{ padding: '12px 8px', textAlign: 'right', color: '#6e7681', fontFamily: 'Consolas, monospace', fontSize: '14px', lineHeight: '21px', userSelect: 'none', minWidth: '44px', overflow: 'hidden' }}>
-          {lines.map((_, i) => (
-            <div key={i} style={{ color: i + 1 === cursor.line ? '#c6c6c6' : undefined }}>{i + 1}</div>
-          ))}
+    <div
+      style={{
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+        backgroundColor: '#1e1e1e',
+        minWidth: 0,
+        minHeight: 0,
+        overflow: 'hidden',
+      }}
+    >
+      {/* Toolbar */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          padding: '6px 12px',
+          backgroundColor: '#2d2d30',
+          borderBottom: '1px solid #3e3e42',
+          flexShrink: 0,
+        }}
+      >
+        <div
+          style={{
+            flex: 1,
+            fontSize: '12px',
+            fontFamily: 'Consolas, monospace',
+            color: openPath ? '#cccccc' : '#666',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {openPath || 'Aucun fichier — choisis-en un dans le panel GitHub'}
+          {dirty ? ' •' : ''}
         </div>
-        <textarea ref={taRef} value={code}
-          onChange={(e) => { setCode(e.target.value); setDirty(true); syncCursor() }}
-          onKeyDown={onKeyDown} onKeyUp={syncCursor} onClick={syncCursor} spellCheck={false}
-          style={{ flex: 1, backgroundColor: '#1e1e1e', color: '#d4d4d4', padding: '12px', border: 'none', fontFamily: 'Consolas, Monaco, monospace', fontSize: '14px', lineHeight: '21px', resize: 'none', outline: 'none', whiteSpace: 'pre', overflowWrap: 'normal', overflowX: 'auto' }} />
+        <button
+          onClick={save}
+          disabled={!dirty || saving || !openPath}
+          style={{
+            ...btn,
+            backgroundColor: dirty ? '#0e639c' : '#3c3c3c',
+            opacity: dirty && !saving && openPath ? 1 : 0.5,
+            cursor: dirty && !saving && openPath ? 'pointer' : 'default',
+          }}
+        >
+          {saving ? '…' : `Push${dirty ? ' *' : ''}`}
+        </button>
       </div>
-      <div style={{ display: 'flex', gap: '16px', padding: '3px 12px', backgroundColor: '#007acc', color: '#fff', fontSize: '12px' }}>
-        <span>Ln {cursor.line}, Col {cursor.col}</span>
-        <span>{lines.length} lignes</span>
-        <span>{lang}</span>
-        <span style={{ marginLeft: 'auto' }}>{status}{dirty ? ' (non sauvegarde)' : ''}</span>
+
+      {/* CodeMirror — zone scrollable */}
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        {openPath ? (
+          <CodeMirror
+            value={content}
+            height="100%"
+            theme={oneDark}
+            extensions={extensions}
+            onChange={(v) => onChange(v)}
+            basicSetup={{
+              lineNumbers: true,
+              highlightActiveLineGutter: true,
+              highlightActiveLine: true,
+              foldGutter: true,
+              indentOnInput: true,
+              tabSize: 2,
+            }}
+            style={{
+              flex: 1,
+              minHeight: 0,
+              fontSize: '13px',
+              height: '100%',
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              flex: 1,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#6e7681',
+              fontSize: 14,
+            }}
+          >
+            Ouvre un fichier depuis le panel GitHub
+          </div>
+        )}
+      </div>
+
+      {/* Status */}
+      <div
+        style={{
+          display: 'flex',
+          gap: '16px',
+          padding: '3px 12px',
+          backgroundColor: '#007acc',
+          color: '#fff',
+          fontSize: '12px',
+          flexShrink: 0,
+        }}
+      >
+        <span>{lines} lignes</span>
+        <span>{langLabel}</span>
+        <span style={{ marginLeft: 'auto' }}>
+          {status}
+          {dirty ? ' (non sauvegardé)' : ''}
+        </span>
       </div>
     </div>
   )
