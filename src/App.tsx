@@ -81,6 +81,7 @@ function App() {
             backgroundColor: '#252526',
             borderRight: '1px solid #3e3e42',
             flexShrink: 0,
+            minHeight: 0,
             overflow: 'auto',
           }}
         >
@@ -99,9 +100,11 @@ function App() {
           style={{
             flex: 1,
             minWidth: 0,
+            minHeight: 0,
             borderRight: '1px solid #3e3e42',
             display: 'flex',
             flexDirection: 'column',
+            overflow: 'hidden',
           }}
         >
           <Chat
@@ -117,8 +120,10 @@ function App() {
           style={{
             flex: 1,
             minWidth: 0,
+            minHeight: 0,
             display: 'flex',
             flexDirection: 'column',
+            overflow: 'hidden',
           }}
         >
           <Editor

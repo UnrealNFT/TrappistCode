@@ -4,7 +4,8 @@ import {
   createFile,
   parseRepoFullName,
   listFiles,
-  readFile
+  readFile,
+  patchFile,
 } from '../services/github'
 
 interface ChatProps {
@@ -16,6 +17,7 @@ interface ChatProps {
 
 const MAX_HISTORY = 12
 const MAX_CONTENT_CHARS = 4000
+const MAX_AUTO_STEPS = 6
 
 function truncateContent(content: string): string {
   if (content.length <= MAX_CONTENT_CHARS) return content
@@ -35,307 +37,316 @@ function Chat({
   selectedAgent,
   githubToken = '',
   isTokenValid = false,
-  selectedRepo = null
+  selectedRepo = null,
 }: ChatProps) {
   const [messages, setMessages] = useState<
     Array<{ role: string; content: string }>
   >([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [autonomous, setAutonomous] = useState(false)
 
   const extractGitHubAction = (text: string) => {
-    // Accepte ```github-action puis JSON (même sur la même ligne)
     const match = text.match(/```github-action\s*([\s\S]*?)```/)
-    if (!match) {
-      console.warn('[github-action] aucun bloc trouvé')
-      return null
+    if (!match) return null
+    const raw = match[1].trim()
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return { __parseError: true as const, raw: raw.slice(0, 200) }
+    }
+  }
+
+  const buildSystemPrompt = () => {
+    if (!isTokenValid) {
+      return `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
+    }
+    if (!selectedRepo) {
+      return `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande de choisir un repo.`
     }
 
-   const raw = match[1].trim()
-    try {
-      const parsed = JSON.parse(raw)
-      console.log('[github-action] OK', parsed?.action, parsed?.path)
-      return parsed
-    } catch (err) {
-      console.error('[github-action] JSON invalide', err)
-      console.error('[github-action] raw=', raw.slice(0, 400))
-      return { __parseError: true, raw: raw.slice(0, 200) }
+    let prompt = `Tu es un assistant de code dans TrappistCode.
+Repo actif : ${selectedRepo}
+Token GitHub : connecté.
+
+Actions — UN seul bloc par réponse :
+
+\`\`\`github-action
+{ ... }
+\`\`\`
+
+1) list_files :
+{"action":"list_files","path":""}
+
+2) read_file :
+{"action":"read_file","path":"src/App.tsx"}
+
+3) create_file (content max ~2500 caractères) :
+{"action":"create_file","path":"README.md","content":"...","message":"Add README"}
+
+4) patch_file (préféré pour modifier un fichier existant) :
+{"action":"patch_file","path":"src/App.tsx","oldText":"texte exact","newText":"nouveau","message":"Patch"}
+
+Règles :
+- Ne simule pas git/bash
+- N'affirme JAMAIS qu'un fichier est poussé : l'app le fait après ton bloc
+- Gros fichier : patch_file ou plusieurs petits create_file
+- Ne devine pas le contenu : read_file d'abord
+- Si aucune action : réponds SANS bloc`
+
+    if (autonomous) {
+      prompt += `
+
+MODE AUTONOMIE :
+- Avance jusqu'à finir la tâche
+- Une seule action github-action par réponse
+- Après chaque résultat système, continue sans demander confirmation
+- Quand c'est terminé : résumé court SANS bloc github-action`
     }
+    return prompt
+  }
+
+  const callLLM = async (
+    apiMessages: Array<{ role: string; content: string }>
+  ): Promise<string> => {
+    if (selectedAgent === 'groq') {
+      const res = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          model: 'llama-3.1-8b-instant',
+          messages: apiMessages,
+          max_tokens: autonomous ? 3072 : 2048,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${import.meta.env.VITE_GROQ_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 60000,
+        }
+      )
+      return extractResponseText(res.data.choices?.[0]?.message)
+    }
+
+    const modelMap: Record<string, string> = {
+      kimi: 'moonshotai/kimi-k3',
+      'kimi-wavespeed': 'moonshotai/kimi-k3',
+      claude: 'anthropic/claude-sonnet-4.5',
+    }
+    const model = modelMap[selectedAgent] ?? 'deepseek/deepseek-v4-flash'
+
+    const res = await axios.post(
+      '/api/wavespeed/chat/completions',
+      {
+        model,
+        messages: apiMessages,
+        max_tokens: autonomous ? 3072 : 2048,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 180000,
+      }
+    )
+    return extractResponseText(res.data.choices?.[0]?.message)
+  }
+
+  const formatLLMError = (e: any): string => {
+    const status = e?.response?.status
+    if (status === 401) return '❌ Clé API invalide (401)'
+    if (status === 413) return '❌ Historique trop long (413). Vide le chat.'
+    if (status === 429) return '❌ Rate limit (429). Attends un peu.'
+    if (e?.code === 'ECONNABORTED' || status === 504) return '❌ Timeout'
+    if (e?.code === 'ERR_NETWORK') return '❌ Erreur réseau'
+    console.error(e)
+    return `❌ Erreur ${selectedAgent}`
+  }
+
+  const runGitHubAction = async (action: any): Promise<string> => {
+    if (!selectedRepo || !githubToken) return '❌ Token ou repo manquant'
+    const { owner, repo } = parseRepoFullName(selectedRepo)
+
+    if (action.action === 'list_files') {
+      const files = await listFiles({
+        token: githubToken,
+        owner,
+        repo,
+        path: action.path || '',
+      })
+      const listing = files
+        .map((f) => `${f.type === 'dir' ? '📁' : '📄'} ${f.path}`)
+        .join('\n')
+      return `📂 Contenu de ${action.path || '/'} :\n\n${listing || '(vide)'}`
+    }
+
+    if (action.action === 'read_file') {
+      if (!action.path) throw new Error('path manquant')
+      const file = await readFile({
+        token: githubToken,
+        owner,
+        repo,
+        path: action.path,
+      })
+      const body = truncateContent(file.content)
+      return `📄 ${file.path}\n\n\`\`\`\n${body}\n\`\`\``
+    }
+
+    if (action.action === 'create_file') {
+      if (!action.path || typeof action.content !== 'string') {
+        throw new Error('create_file incomplet (path/content)')
+      }
+      await createFile({
+        token: githubToken,
+        owner,
+        repo,
+        path: action.path,
+        content: action.content,
+        message: action.message || `Add ${action.path}`,
+      })
+      return (
+        `✅ Fichier **${action.path}** créé/mis à jour.\n` +
+        `https://github.com/${selectedRepo}/blob/main/${action.path}`
+      )
+    }
+
+    if (action.action === 'patch_file') {
+      if (!action.path || typeof action.oldText !== 'string' || typeof action.newText !== 'string') {
+        throw new Error('patch_file incomplet (path/oldText/newText)')
+      }
+      await patchFile({
+        token: githubToken,
+        owner,
+        repo,
+        path: action.path,
+        oldText: action.oldText,
+        newText: action.newText,
+        message: action.message || `Patch ${action.path}`,
+      })
+      return (
+        `✅ Patch appliqué sur **${action.path}**.\n` +
+        `https://github.com/${selectedRepo}/blob/main/${action.path}`
+      )
+    }
+
+    return `❌ Action inconnue : ${action.action}`
   }
 
   const sendMessage = async () => {
     if (!input.trim() || loading) return
 
     const userMessage = { role: 'user', content: input }
-    const updatedMessages = [...messages, userMessage]
-
-    setMessages(updatedMessages)
+    let thread = [...messages, userMessage]
+    setMessages(thread)
     setInput('')
     setLoading(true)
 
-    let responseContent = ''
+    const systemMessage = { role: 'system', content: buildSystemPrompt() }
+    let steps = 0
 
-    const systemMessage = {
-      role: 'system',
-      content:
-        isTokenValid && selectedRepo
-          ? `Tu es un assistant de code dans TrappistCode.
-Repo actif : ${selectedRepo}
-Token GitHub : connecté (fourni par l'utilisateur, déjà authentifié).
+    try {
+      while (steps < (autonomous ? MAX_AUTO_STEPS : 1)) {
+        steps++
 
-Tu as 3 actions. Quand tu en as besoin, termine ta réponse avec UN seul bloc :
+        const recent = thread.slice(-MAX_HISTORY).map((m) => ({
+          role: m.role,
+          content: truncateContent(m.content),
+        }))
+        const apiMessages = [systemMessage, ...recent]
 
-\`\`\`github-action
-{ ... }
-\`\`\`
-
-1) Lister un dossier ("" = racine) :
-{"action":"list_files","path":""}
-
-2) Lire un fichier :
-{"action":"read_file","path":"index.html"}
-
-3) Créer ou mettre à jour un fichier :
-{"action":"create_file","path":"README.md","content":"...","message":"Add README.md"}
-
-Règles STRICTES :
-- Ne devine pas le contenu des fichiers : utilise list_files ou read_file
-- Ne simule pas git/bash / commit / push
-- N'affirme JAMAIS qu'un fichier a été créé ou poussé : c'est l'application qui le fait après ton bloc
-- create_file : contenu max ~3000 caractères. Fichiers plus gros = refuse et propose une version courte
-- path peut être un sous-dossier (ex: src/app.js)
-- Si aucune action n'est nécessaire, réponds normalement SANS bloc`
-          : isTokenValid
-            ? `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande à l'utilisateur de choisir un repo.`
-            : `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
-    }
-
-    const recent = updatedMessages.slice(-MAX_HISTORY).map((m) => ({
-      role: m.role,
-      content: truncateContent(m.content)
-    }))
-
-    const messagesForApi = [systemMessage, ...recent]
-
-    // --- Appel LLM ---
-    if (selectedAgent === 'groq') {
-      try {
-        const groqRes = await axios.post(
-          'https://api.groq.com/openai/v1/chat/completions',
-          {
-            model: 'llama-3.1-8b-instant',
-            messages: messagesForApi,
-            max_tokens: 2048
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${import.meta.env.VITE_GROQ_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 60000
-          }
-        )
-        responseContent = extractResponseText(groqRes.data.choices?.[0]?.message)
-      } catch (e: any) {
-        const status = e?.response?.status
-        if (status === 413) {
-          responseContent =
-            '❌ Historique trop long (413). Clique sur "Vider le chat" ou envoie un message plus court.'
-        } else if (status === 401) {
-          responseContent = '❌ Clé Groq invalide (401)'
-        } else if (e?.code === 'ECONNABORTED') {
-          responseContent = '❌ Timeout Groq'
-        } else {
-          console.error(e)
-          responseContent = 'Erreur Groq'
-        }
-      }
-    } else {
-      const modelMap: Record<string, string> = {
-        kimi: 'moonshotai/kimi-k3',
-        'kimi-wavespeed': 'moonshotai/kimi-k3',
-        claude: 'anthropic/claude-sonnet-4.5'
-      }
-      const model = modelMap[selectedAgent] ?? 'deepseek/deepseek-v4-flash'
-
-      try {
-        const res = await axios.post(
-          '/api/wavespeed/chat/completions',
-          {
-            model,
-            messages: messagesForApi,
-            max_tokens: 2048
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 180000
-          }
-        )
-        responseContent = extractResponseText(res.data.choices?.[0]?.message)
-      } catch (e: any) {
-        const status = e?.response?.status
-        if (status === 401) {
-          responseContent = '❌ Clé WaveSpeed invalide (401)'
-        } else if (status === 413) {
-          responseContent =
-            '❌ Historique trop long (413). Videz le chat ou raccourcissez le message.'
-        } else if (e?.code === 'ECONNABORTED' || status === 504) {
-          responseContent = `❌ Timeout ${selectedAgent}`
-        } else if (
-          e?.message?.includes('Network') ||
-          e?.message?.includes('CORS') ||
-          e?.code === 'ERR_NETWORK'
-        ) {
-          responseContent =
-            '❌ CORS / réseau WaveSpeed. Vérifie la clé ou réessaie.'
-        } else {
-          console.error(e)
-          responseContent = 'Erreur ' + selectedAgent
-        }
-      }
-    }
-
-    setMessages((prev) => [
-      ...prev,
-      { role: 'assistant', content: responseContent }
-    ])
-
-    // --- Exécution GitHub ---
-    const action = extractGitHubAction(responseContent)
-
-    if (action?.__parseError) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content:
-            '❌ Action GitHub invalide : JSON tronqué ou mal formé.\n' +
-            'Demande un fichier plus petit (ex: README court).'
-        }
-      ])
-      setLoading(false)
-      return
-    }
-
-    if (action && isTokenValid && selectedRepo && githubToken) {
-      try {
-        const { owner, repo } = parseRepoFullName(selectedRepo)
-
-        if (action.action === 'list_files') {
-          const files = await listFiles({
-            token: githubToken,
-            owner,
-            repo,
-            path: action.path || ''
-          })
-          const listing = files
-            .map((f) => `${f.type === 'dir' ? '📁' : '📄'} ${f.path}`)
-            .join('\n')
-
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: `📂 Contenu de ${action.path || '/'} :\n\n${listing || '(vide)'}`
-            }
-          ])
+        let responseContent = ''
+        try {
+          responseContent = await callLLM(apiMessages)
+        } catch (e: any) {
+          responseContent = formatLLMError(e)
+          thread = [...thread, { role: 'assistant', content: responseContent }]
+          setMessages(thread)
+          break
         }
 
-        if (action.action === 'read_file') {
-          if (!action.path) throw new Error('path manquant pour read_file')
+        thread = [...thread, { role: 'assistant', content: responseContent }]
+        setMessages(thread)
 
-          const file = await readFile({
-            token: githubToken,
-            owner,
-            repo,
-            path: action.path
-          })
+        const action = extractGitHubAction(responseContent)
 
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: `📄 ${file.path}\n\n\`\`\`\n${file.content}\n\`\`\``
-            }
-          ])
-        }
+        if (!action) break
 
-        if (action.action === 'create_file') {
-          if (!action.path || typeof action.content !== 'string') {
-            throw new Error('create_file incomplet (path ou content manquant)')
-          }
-
-          console.log(
-            '[create_file]',
-            selectedRepo,
-            action.path,
-            'chars=',
-            action.content.length
-          )
-
-          await createFile({
-            token: githubToken,
-            owner,
-            repo,
-            path: action.path,
-            content: action.content,
-            message: action.message || `Add ${action.path}`
-          })
-
-          setMessages((prev) => [
-            ...prev,
+        if (action.__parseError) {
+          thread = [
+            ...thread,
             {
               role: 'assistant',
               content:
-                `✅ Fichier **${action.path}** créé/mis à jour sur GitHub.\n` +
-                `https://github.com/${selectedRepo}/blob/main/${action.path}`
-            }
-          ])
+                '❌ Action GitHub invalide : JSON tronqué.\nUtilise patch_file ou un fichier plus petit.',
+            },
+          ]
+          setMessages(thread)
+          break
         }
-      } catch (e: any) {
-        const status = e?.response?.status
-        const errMsg =
-          e?.response?.data?.message || e?.message || 'Erreur inconnue'
-        console.error('[github] erreur', status, errMsg, e)
-        setMessages((prev) => [
-          ...prev,
+
+        if (!isTokenValid || !selectedRepo || !githubToken) {
+          thread = [
+            ...thread,
+            {
+              role: 'assistant',
+              content: !isTokenValid
+                ? '❌ Token GitHub manquant.'
+                : '❌ Aucun repo sélectionné.',
+            },
+          ]
+          setMessages(thread)
+          break
+        }
+
+        let result = ''
+        try {
+          result = await runGitHubAction(action)
+        } catch (e: any) {
+          const status = e?.response?.status
+          const errMsg =
+            e?.response?.data?.message || e?.message || 'Erreur inconnue'
+          result = `❌ Erreur GitHub (${status || '?'}) : ${errMsg}`
+        }
+
+        thread = [...thread, { role: 'assistant', content: result }]
+        setMessages(thread)
+
+        // Mode normal : une seule action puis stop
+        if (!autonomous) break
+
+        // Mode autonomie : on renvoie le résultat au LLM au tour suivant
+        // (déjà dans thread → recent)
+      }
+
+      if (autonomous && steps >= MAX_AUTO_STEPS) {
+        thread = [
+          ...thread,
           {
             role: 'assistant',
-            content: `❌ Erreur GitHub (${status || '?'}) : ${errMsg}`
-          }
-        ])
+            content: `⏹️ Limite autonomie atteinte (${MAX_AUTO_STEPS} étapes). Relance si besoin.`,
+          },
+        ]
+        setMessages(thread)
       }
-    } else if (action && !isTokenValid) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: '❌ Token GitHub invalide ou manquant.'
-        }
-      ])
-    } else if (action && !selectedRepo) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: '❌ Aucun repo sélectionné.'
-        }
-      ])
+    } finally {
+      setLoading(false)
     }
-
-    setLoading(false)
   }
 
-  const clearChat = () => {
-    setMessages([])
-  }
+  const clearChat = () => setMessages([])
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-      {/* Tab Bar */}
+    <div
+      style={{
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: 0,
+        overflow: 'hidden',
+      }}
+    >
+      {/* Tab bar */}
       <div
         style={{
           height: '35px',
@@ -343,14 +354,15 @@ Règles STRICTES :
           borderBottom: '1px solid #3e3e42',
           display: 'flex',
           alignItems: 'center',
-          paddingLeft: '16px'
+          paddingLeft: '16px',
+          flexShrink: 0,
         }}
       >
         <div
           style={{
             padding: '0 16px',
             borderTop: '2px solid #007acc',
-            backgroundColor: '#1e1e1e'
+            backgroundColor: '#1e1e1e',
           }}
         >
           chat.tsx
@@ -366,11 +378,31 @@ Règles STRICTES :
             fontSize: '11px',
             padding: '2px 8px',
             borderRadius: '4px',
-            cursor: 'pointer'
+            cursor: 'pointer',
           }}
         >
           Vider le chat
         </button>
+
+        <label
+          style={{
+            marginLeft: '12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            fontSize: '11px',
+            color: autonomous ? '#4ec9b0' : '#cccccc',
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={autonomous}
+            onChange={(e) => setAutonomous(e.target.checked)}
+          />
+          Autonomie
+        </label>
 
         {isTokenValid && (
           <div
@@ -378,7 +410,7 @@ Règles STRICTES :
               marginLeft: 'auto',
               paddingRight: '16px',
               fontSize: '11px',
-              color: '#4ec9b0'
+              color: '#4ec9b0',
             }}
           >
             GitHub OK {selectedRepo ? `· ${selectedRepo}` : ''}
@@ -390,18 +422,22 @@ Règles STRICTES :
       <div
         style={{
           flex: 1,
+          minHeight: 0,
           overflow: 'auto',
           padding: '24px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '24px'
+          gap: '24px',
         }}
       >
         {messages.length === 0 && (
-          <div
-            style={{ textAlign: 'center', color: '#666', marginTop: '80px' }}
-          >
+          <div style={{ textAlign: 'center', color: '#666', marginTop: '80px' }}>
             Commence à parler...
+            {autonomous && (
+              <div style={{ marginTop: 8, color: '#4ec9b0', fontSize: 12 }}>
+                Mode autonomie ON — l’agent enchaîne jusqu’à {MAX_AUTO_STEPS} étapes
+              </div>
+            )}
           </div>
         )}
         {messages.map((msg, index) => (
@@ -414,13 +450,18 @@ Règles STRICTES :
               backgroundColor: msg.role === 'user' ? '#094771' : '#252526',
               color: '#cccccc',
               whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word'
+              wordBreak: 'break-word',
+              flexShrink: 0,
             }}
           >
             {msg.content || '(message vide)'}
           </div>
         ))}
-        {loading && <div style={{ color: '#666' }}>Agent réfléchit...</div>}
+        {loading && (
+          <div style={{ color: '#666' }}>
+            Agent réfléchit{autonomous ? ' (autonomie)...' : '...'}
+          </div>
+        )}
       </div>
 
       {/* Input */}
@@ -428,7 +469,8 @@ Règles STRICTES :
         style={{
           padding: '16px',
           borderTop: '1px solid #3e3e42',
-          backgroundColor: '#252526'
+          backgroundColor: '#252526',
+          flexShrink: 0,
         }}
       >
         <div style={{ display: 'flex', gap: '12px' }}>
@@ -436,8 +478,8 @@ Règles STRICTES :
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-            placeholder="Ex: lis les fichiers · lis index.html · crée un README"
+            onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+            placeholder="Ex: lis les fichiers · patch App.tsx · crée un README"
             style={{
               flex: 1,
               backgroundColor: '#3c3c3c',
@@ -445,7 +487,7 @@ Règles STRICTES :
               borderRadius: '4px',
               padding: '12px',
               color: '#cccccc',
-              outline: 'none'
+              outline: 'none',
             }}
           />
           <button
@@ -456,8 +498,9 @@ Règles STRICTES :
               color: 'white',
               padding: '0 32px',
               borderRadius: '4px',
-              cursor: 'pointer',
-              border: 'none'
+              cursor: loading || !input.trim() ? 'default' : 'pointer',
+              border: 'none',
+              opacity: loading || !input.trim() ? 0.6 : 1,
             }}
           >
             Envoyer

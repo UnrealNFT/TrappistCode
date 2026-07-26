@@ -23,10 +23,9 @@ export async function createFile(params: {
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28'
+    'X-GitHub-Api-Version': '2022-11-28',
   }
 
-  // Si le fichier existe déjà, récupérer son sha
   let sha: string | undefined
   try {
     const existing = await axios.get(url, { headers })
@@ -41,7 +40,7 @@ export async function createFile(params: {
     sha?: string
   } = {
     message: message || (sha ? `Update ${path}` : `Add ${path}`),
-    content: contentBase64
+    content: contentBase64,
   }
 
   if (sha) {
@@ -70,8 +69,8 @@ export async function listFiles(params: {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28'
-    }
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
   })
 
   const data = res.data
@@ -81,7 +80,7 @@ export async function listFiles(params: {
         name: item.name,
         path: item.path,
         type: item.type,
-        size: item.size
+        size: item.size,
       })
     )
   }
@@ -91,8 +90,8 @@ export async function listFiles(params: {
       name: data.name,
       path: data.path,
       type: data.type,
-      size: data.size
-    }
+      size: data.size,
+    },
   ]
 }
 
@@ -112,8 +111,8 @@ export async function readFile(params: {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28'
-    }
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
   })
 
   if (res.data.type !== 'file') {
@@ -127,6 +126,41 @@ export async function readFile(params: {
   return {
     path: res.data.path,
     content,
-    sha: res.data.sha
+    sha: res.data.sha,
   }
+}
+
+/**
+ * Patch un fichier : remplace oldText par newText (1ère occurrence)
+ * Puis commit via createFile (update avec sha)
+ */
+export async function patchFile(params: {
+  token: string
+  owner: string
+  repo: string
+  path: string
+  oldText: string
+  newText: string
+  message?: string
+}) {
+  const { token, owner, repo, path, oldText, newText, message } = params
+
+  const current = await readFile({ token, owner, repo, path })
+
+  if (!current.content.includes(oldText)) {
+    throw new Error(
+      `Texte introuvable dans ${path}. Vérifie que oldText correspond exactement.`
+    )
+  }
+
+  const updated = current.content.replace(oldText, newText)
+
+  return createFile({
+    token,
+    owner,
+    repo,
+    path,
+    content: updated,
+    message: message || `Patch ${path}`,
+  })
 }
