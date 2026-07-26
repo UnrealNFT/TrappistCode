@@ -1,4 +1,3 @@
-
 import { useState } from 'react'
 import axios from 'axios'
 import {
@@ -15,23 +14,52 @@ interface ChatProps {
   selectedRepo?: string | null
 }
 
+const MAX_HISTORY = 12
+const MAX_CONTENT_CHARS = 4000
+
+function truncateContent(content: string): string {
+  if (content.length <= MAX_CONTENT_CHARS) return content
+  return (
+    content.slice(0, MAX_CONTENT_CHARS) +
+    '\n\n…[contenu tronqué pour limiter la taille de la requête]'
+  )
+}
+
+function extractResponseText(message: any): string {
+  const content = message?.content?.trim?.() || ''
+  const reasoning = message?.reasoning_content?.trim?.() || ''
+  return content || reasoning || '(réponse vide)'
+}
+
 function Chat({
   selectedAgent,
   githubToken = '',
   isTokenValid = false,
   selectedRepo = null
 }: ChatProps) {
-  const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([])
+  const [messages, setMessages] = useState<
+    Array<{ role: string; content: string }>
+  >([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
 
   const extractGitHubAction = (text: string) => {
+    // Accepte ```github-action puis JSON (même sur la même ligne)
     const match = text.match(/```github-action\s*([\s\S]*?)```/)
-    if (!match) return null
-    try {
-      return JSON.parse(match[1].trim())
-    } catch {
+    if (!match) {
+      console.warn('[github-action] aucun bloc trouvé')
       return null
+    }
+
+   const raw = match[1].trim()
+    try {
+      const parsed = JSON.parse(raw)
+      console.log('[github-action] OK', parsed?.action, parsed?.path)
+      return parsed
+    } catch (err) {
+      console.error('[github-action] JSON invalide', err)
+      console.error('[github-action] raw=', raw.slice(0, 400))
+      return { __parseError: true, raw: raw.slice(0, 200) }
     }
   }
 
@@ -53,9 +81,9 @@ function Chat({
         isTokenValid && selectedRepo
           ? `Tu es un assistant de code dans TrappistCode.
 Repo actif : ${selectedRepo}
-Token GitHub : connecté
+Token GitHub : connecté (fourni par l'utilisateur, déjà authentifié).
 
-Tu as 3 actions. Quand tu en as besoin, termine avec UN bloc :
+Tu as 3 actions. Quand tu en as besoin, termine ta réponse avec UN seul bloc :
 
 \`\`\`github-action
 { ... }
@@ -68,19 +96,26 @@ Tu as 3 actions. Quand tu en as besoin, termine avec UN bloc :
 {"action":"read_file","path":"index.html"}
 
 3) Créer ou mettre à jour un fichier :
-{"action":"create_file","path":"index.html","content":"...","message":"Update index.html"}
+{"action":"create_file","path":"README.md","content":"...","message":"Add README.md"}
 
-Règles :
+Règles STRICTES :
 - Ne devine pas le contenu des fichiers : utilise list_files ou read_file
-- Ne simule pas git/bash
+- Ne simule pas git/bash / commit / push
+- N'affirme JAMAIS qu'un fichier a été créé ou poussé : c'est l'application qui le fait après ton bloc
+- create_file : contenu max ~3000 caractères. Fichiers plus gros = refuse et propose une version courte
 - path peut être un sous-dossier (ex: src/app.js)
-- Si aucune action n'est nécessaire, réponds normalement sans bloc`
+- Si aucune action n'est nécessaire, réponds normalement SANS bloc`
           : isTokenValid
             ? `Tu es un assistant dans TrappistCode. Token GitHub connecté mais aucun repo sélectionné. Demande à l'utilisateur de choisir un repo.`
             : `Tu es un assistant dans TrappistCode. Aucun token GitHub connecté.`
     }
 
-    const messagesForApi = [systemMessage, ...updatedMessages]
+    const recent = updatedMessages.slice(-MAX_HISTORY).map((m) => ({
+      role: m.role,
+      content: truncateContent(m.content)
+    }))
+
+    const messagesForApi = [systemMessage, ...recent]
 
     // --- Appel LLM ---
     if (selectedAgent === 'groq') {
@@ -89,35 +124,77 @@ Règles :
           'https://api.groq.com/openai/v1/chat/completions',
           {
             model: 'llama-3.1-8b-instant',
-            messages: messagesForApi
+            messages: messagesForApi,
+            max_tokens: 2048
           },
           {
-            headers: { Authorization: `Bearer ${import.meta.env.VITE_GROQ_KEY}` }
+            headers: {
+              Authorization: `Bearer ${import.meta.env.VITE_GROQ_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 60000
           }
         )
-        responseContent = groqRes.data.choices[0].message.content
-      } catch {
-        responseContent = 'Erreur Groq'
+        responseContent = extractResponseText(groqRes.data.choices?.[0]?.message)
+      } catch (e: any) {
+        const status = e?.response?.status
+        if (status === 413) {
+          responseContent =
+            '❌ Historique trop long (413). Clique sur "Vider le chat" ou envoie un message plus court.'
+        } else if (status === 401) {
+          responseContent = '❌ Clé Groq invalide (401)'
+        } else if (e?.code === 'ECONNABORTED') {
+          responseContent = '❌ Timeout Groq'
+        } else {
+          console.error(e)
+          responseContent = 'Erreur Groq'
+        }
       }
     } else {
-      const model =
-        selectedAgent === 'kimi'
-          ? 'moonshotai/kimi-k3'
-          : 'anthropic/claude-sonnet-4.5'
+      const modelMap: Record<string, string> = {
+        kimi: 'moonshotai/kimi-k3',
+        'kimi-wavespeed': 'moonshotai/kimi-k3',
+        claude: 'anthropic/claude-sonnet-4.5'
+      }
+      const model = modelMap[selectedAgent] ?? 'deepseek/deepseek-v4-flash'
+
       try {
         const res = await axios.post(
-          '/wavespeed/v1/chat/completions',
-          { model, messages: messagesForApi },
+          '/api/wavespeed/chat/completions',
+          {
+            model,
+            messages: messagesForApi,
+            max_tokens: 2048
+          },
           {
             headers: {
-              Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}`
+              Authorization: `Bearer ${import.meta.env.VITE_WAVESPEED_KEY}`,
+              'Content-Type': 'application/json'
             },
-            timeout: 600000
+            timeout: 180000
           }
         )
-        responseContent = res.data.choices[0].message.content
-      } catch {
-        responseContent = 'Erreur ' + selectedAgent
+        responseContent = extractResponseText(res.data.choices?.[0]?.message)
+      } catch (e: any) {
+        const status = e?.response?.status
+        if (status === 401) {
+          responseContent = '❌ Clé WaveSpeed invalide (401)'
+        } else if (status === 413) {
+          responseContent =
+            '❌ Historique trop long (413). Videz le chat ou raccourcissez le message.'
+        } else if (e?.code === 'ECONNABORTED' || status === 504) {
+          responseContent = `❌ Timeout ${selectedAgent}`
+        } else if (
+          e?.message?.includes('Network') ||
+          e?.message?.includes('CORS') ||
+          e?.code === 'ERR_NETWORK'
+        ) {
+          responseContent =
+            '❌ CORS / réseau WaveSpeed. Vérifie la clé ou réessaie.'
+        } else {
+          console.error(e)
+          responseContent = 'Erreur ' + selectedAgent
+        }
       }
     }
 
@@ -128,6 +205,20 @@ Règles :
 
     // --- Exécution GitHub ---
     const action = extractGitHubAction(responseContent)
+
+    if (action?.__parseError) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content:
+            '❌ Action GitHub invalide : JSON tronqué ou mal formé.\n' +
+            'Demande un fichier plus petit (ex: README court).'
+        }
+      ])
+      setLoading(false)
+      return
+    }
 
     if (action && isTokenValid && selectedRepo && githubToken) {
       try {
@@ -154,6 +245,8 @@ Règles :
         }
 
         if (action.action === 'read_file') {
+          if (!action.path) throw new Error('path manquant pour read_file')
+
           const file = await readFile({
             token: githubToken,
             owner,
@@ -171,6 +264,18 @@ Règles :
         }
 
         if (action.action === 'create_file') {
+          if (!action.path || typeof action.content !== 'string') {
+            throw new Error('create_file incomplet (path ou content manquant)')
+          }
+
+          console.log(
+            '[create_file]',
+            selectedRepo,
+            action.path,
+            'chars=',
+            action.content.length
+          )
+
           await createFile({
             token: githubToken,
             owner,
@@ -184,21 +289,48 @@ Règles :
             ...prev,
             {
               role: 'assistant',
-              content: `✅ Fichier **${action.path}** créé/mis à jour sur GitHub.\nhttps://github.com/${selectedRepo}`
+              content:
+                `✅ Fichier **${action.path}** créé/mis à jour sur GitHub.\n` +
+                `https://github.com/${selectedRepo}/blob/main/${action.path}`
             }
           ])
         }
       } catch (e: any) {
+        const status = e?.response?.status
         const errMsg =
           e?.response?.data?.message || e?.message || 'Erreur inconnue'
+        console.error('[github] erreur', status, errMsg, e)
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: `❌ Erreur GitHub : ${errMsg}` }
+          {
+            role: 'assistant',
+            content: `❌ Erreur GitHub (${status || '?'}) : ${errMsg}`
+          }
         ])
       }
+    } else if (action && !isTokenValid) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: '❌ Token GitHub invalide ou manquant.'
+        }
+      ])
+    } else if (action && !selectedRepo) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: '❌ Aucun repo sélectionné.'
+        }
+      ])
     }
 
     setLoading(false)
+  }
+
+  const clearChat = () => {
+    setMessages([])
   }
 
   return (
@@ -223,6 +355,23 @@ Règles :
         >
           chat.tsx
         </div>
+
+        <button
+          onClick={clearChat}
+          style={{
+            marginLeft: '12px',
+            background: 'transparent',
+            border: '1px solid #3e3e42',
+            color: '#cccccc',
+            fontSize: '11px',
+            padding: '2px 8px',
+            borderRadius: '4px',
+            cursor: 'pointer'
+          }}
+        >
+          Vider le chat
+        </button>
+
         {isTokenValid && (
           <div
             style={{
@@ -249,7 +398,9 @@ Règles :
         }}
       >
         {messages.length === 0 && (
-          <div style={{ textAlign: 'center', color: '#666', marginTop: '80px' }}>
+          <div
+            style={{ textAlign: 'center', color: '#666', marginTop: '80px' }}
+          >
             Commence à parler...
           </div>
         )}
